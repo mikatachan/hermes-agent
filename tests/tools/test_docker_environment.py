@@ -44,6 +44,7 @@ def _make_dummy_env(**kwargs):
         auto_mount_cwd=kwargs.get("auto_mount_cwd", False),
         env=kwargs.get("env"),
         run_as_host_user=kwargs.get("run_as_host_user", False),
+        extra_args=kwargs.get("extra_args"),
         persist_across_processes=kwargs.get("persist_across_processes", True),
     )
 
@@ -133,6 +134,37 @@ def test_auto_mount_host_cwd_adds_volume(monkeypatch, tmp_path):
     assert run_calls, "docker run should have been called"
     run_args_str = " ".join(run_calls[0][0])
     assert f"{project_dir}:/workspace" in run_args_str
+
+
+def test_docker_backend_forces_network_none(monkeypatch):
+    """Fresh Hermes Docker sandboxes must always be created on the ``none``
+    network, even if the caller left ``network=True`` / defaulted it."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(network=True)
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    assert "--network=none" in run_calls[0][0], (
+        f"docker run must force --network=none, got: {run_calls[0][0]}"
+    )
+
+
+def test_docker_backend_ignores_network_extra_args(monkeypatch):
+    """User-supplied docker_extra_args must not override the forced air-gap."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(extra_args=["--network=bridge", "--net", "host"])
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args = run_calls[0][0]
+    assert run_args.count("--network=none") == 1, f"expected a single forced none network, got {run_args}"
+    assert "--network=bridge" not in run_args, f"bridge override must be stripped, got {run_args}"
+    assert "--net" not in run_args, f"--net override must be stripped, got {run_args}"
+    assert "host" not in run_args, f"network override value must be stripped, got {run_args}"
 
 
 def test_auto_mount_disabled_by_default(monkeypatch, tmp_path):

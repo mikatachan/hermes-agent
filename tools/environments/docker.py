@@ -569,8 +569,13 @@ class DockerEnvironment(BaseEnvironment):
                     "Docker storage driver does not support per-container disk limits "
                     "(requires overlay2 on XFS with pquota). Container will run without disk quota."
                 )
-        if not network:
-            resource_args.append("--network=none")
+        # Force the structural air-gap at the actual docker-run chokepoint.
+        # Relying on bridged docker_extra_args was leaky: config/env bridge
+        # gaps could drop ``--network=none``, and label-only reuse could then
+        # re-adopt an older bridged container. Hard-code the create-time
+        # network here so every fresh Hermes Docker sandbox lands on Docker's
+        # built-in ``none`` network regardless of caller/config plumbing.
+        resource_args.append("--network=none")
 
         # Persistent workspace via bind mounts from a configurable host directory
         # (TERMINAL_SANDBOX_DIR, default ~/.hermes/sandboxes/). Non-persistent
@@ -767,9 +772,30 @@ class DockerEnvironment(BaseEnvironment):
         # User-supplied extra docker run flags (docker_extra_args in config.yaml).
         # Appended last so they can override defaults if needed.
         validated_extra = []
+        skip_network_value = False
         for arg in (extra_args or []):
+            if skip_network_value:
+                skip_network_value = False
+                logger.warning(
+                    "Ignoring docker_extra_args network value %r; Docker backend always forces --network=none",
+                    arg,
+                )
+                continue
             if not isinstance(arg, str):
                 logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
+                continue
+            if arg in {"--network", "--net"}:
+                skip_network_value = True
+                logger.warning(
+                    "Ignoring docker_extra_args flag %r; Docker backend always forces --network=none",
+                    arg,
+                )
+                continue
+            if arg.startswith("--network=") or arg.startswith("--net="):
+                logger.warning(
+                    "Ignoring docker_extra_args flag %r; Docker backend always forces --network=none",
+                    arg,
+                )
                 continue
             validated_extra.append(arg)
 

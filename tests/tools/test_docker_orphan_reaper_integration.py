@@ -137,3 +137,55 @@ def test_maybe_reap_swallows_exceptions(monkeypatch):
     with patch("tools.environments.docker.reap_orphan_containers", _exploding_reap):
         # Must not raise
         terminal_tool._maybe_reap_docker_orphans({"docker_orphan_reaper": True})
+
+
+def test_create_environment_purges_before_docker_ctor_and_forces_no_reuse(monkeypatch):
+    """Docker task startup must purge labeled containers before constructor
+    entry and must force ``persist_across_processes=False`` so label-only
+    reuse cannot re-adopt an older bridged container."""
+    call_order = []
+    captured = {}
+
+    def _fake_purge():
+        call_order.append("purge")
+
+    def _fake_reap(config):
+        call_order.append("reap")
+        assert config["docker_persist_across_processes"] is True
+
+    def _fake_ctor(**kwargs):
+        call_order.append("ctor")
+        captured.update(kwargs)
+        return "docker-env"
+
+    monkeypatch.setattr(terminal_tool, "_purge_hermes_docker_containers", _fake_purge)
+    monkeypatch.setattr(terminal_tool, "_maybe_reap_docker_orphans", _fake_reap)
+    monkeypatch.setattr(terminal_tool, "_DockerEnvironment", _fake_ctor)
+
+    result = terminal_tool._create_environment(
+        env_type="docker",
+        image="python:3.11",
+        cwd="/root",
+        timeout=60,
+        container_config={
+            "container_cpu": 1,
+            "container_memory": 512,
+            "container_disk": 1024,
+            "container_persistent": True,
+            "docker_volumes": [],
+            "docker_forward_env": [],
+            "docker_env": {},
+            "docker_extra_args": [],
+            "docker_persist_across_processes": True,
+            "docker_orphan_reaper": True,
+        },
+        task_id="task-123",
+    )
+
+    assert result == "docker-env"
+    assert call_order == ["purge", "reap", "ctor"], (
+        f"expected purge before ctor, got call order {call_order}"
+    )
+    assert captured["persist_across_processes"] is False, (
+        "docker task startup must force persist_across_processes=False"
+    )
