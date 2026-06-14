@@ -1,5 +1,7 @@
 """Tests for ${ENV_VAR} substitution in config.yaml values."""
 
+import os
+
 import pytest
 from hermes_cli.config import _expand_env_vars, load_config
 
@@ -131,3 +133,22 @@ class TestLoadCliConfigExpansion:
         config = load_cli_config()
 
         assert config["auxiliary"]["vision"]["api_key"] == "${UNSET_CLI_VAR_ABC}"
+
+    def test_cli_config_bridges_docker_extra_args(self, tmp_path, monkeypatch):
+        config_yaml = (
+            "terminal:\n"
+            "  backend: docker\n"
+            "  docker_extra_args:\n"
+            "    - --network=host\n"
+        )
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(config_yaml)
+
+        monkeypatch.delenv("TERMINAL_DOCKER_EXTRA_ARGS", raising=False)
+        monkeypatch.setattr("cli._hermes_home", tmp_path)
+
+        from cli import load_cli_config
+
+        load_cli_config()
+
+        assert os.environ["TERMINAL_DOCKER_EXTRA_ARGS"] == '["--network=host"]'
