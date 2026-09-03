@@ -918,6 +918,11 @@ class DiscordAdapter(BasePlatformAdapter):
                         guild=_msg_guild,
                         is_dm=_is_dm,
                     ):
+                        logger.info(
+                            "[Discord] DROPPED: user %s not in allowlist (channel=%s)",
+                            message.author.id,
+                            getattr(message.channel, "id", "?"),
+                        )
                         return
                     _role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
                 
@@ -4952,6 +4957,18 @@ class DiscordAdapter(BasePlatformAdapter):
 
             if require_mention and not is_free_channel and not in_bot_thread:
                 if self._client.user not in message.mentions and not mention_prefix:
+                    # The author already passed the allow-list above, so this is
+                    # an AUTHORISED user being silently ignored. Logged at INFO
+                    # because the absence of this line cost 33 days of undetected
+                    # unreachability (2026-07-05 -> 2026-09-03): a dropped message
+                    # was indistinguishable from a message never sent.
+                    logger.info(
+                        "[Discord] DROPPED: no mention, channel=%s not in "
+                        "free_response_channels (user=%s). Add the channel id to "
+                        "discord.free_response_channels or @mention the bot.",
+                        getattr(message.channel, "id", "?"),
+                        message.author.id,
+                    )
                     return
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
