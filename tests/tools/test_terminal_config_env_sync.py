@@ -301,3 +301,16 @@ def test_docker_forward_env_is_bridged_everywhere():
     assert "docker_forward_env" in _gateway_env_map_keys()
     assert "docker_forward_env" in _save_config_env_sync_keys()
     assert "TERMINAL_DOCKER_FORWARD_ENV" in _terminal_tool_env_var_names()
+
+
+def test_docker_extra_args_is_bridged_everywhere():
+    """Regression pin for ``terminal.docker_extra_args``.
+
+    This is the load-bearing bridge for config-supplied Docker networking and
+    other raw ``docker run`` flags. If cli.py or gateway/run.py drops it, the
+    caller's requested network mode never reaches ``DockerEnvironment``.
+    """
+    assert "docker_extra_args" in _cli_env_map_keys()
+    assert "docker_extra_args" in _gateway_env_map_keys()
+    assert "docker_extra_args" in _save_config_env_sync_keys()
+    assert "TERMINAL_DOCKER_EXTRA_ARGS" in _terminal_tool_env_var_names()

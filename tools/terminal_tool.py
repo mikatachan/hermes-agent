@@ -873,6 +873,69 @@ _docker_orphan_reaper_ran = False
 _docker_orphan_reaper_lock = threading.Lock()
 
 
+def _purge_hermes_docker_containers() -> None:
+    """Fail closed: clear Hermes-labeled containers before each Docker task.
+
+    The Docker backend's historical cross-process reuse matched on labels
+    only, so a previously created bridged container could be re-adopted even
+    after the create path was tightened to ``--network=none``. Purging the
+    labeled set before task startup guarantees the next container is freshly
+    created under the hardened network mode instead of inheriting old state.
+    """
+    try:
+        from tools.environments.docker import find_docker
+    except ImportError:
+        return
+
+    docker = find_docker() or "docker"
+    try:
+        listing = subprocess.run(
+            [docker, "ps", "-aq", "--filter", "label=hermes-agent=1"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise RuntimeError(
+            f"Failed to enumerate Hermes Docker containers before task startup: {e}"
+        ) from e
+    if listing.returncode != 0:
+        raise RuntimeError(
+            "Failed to enumerate Hermes Docker containers before task startup: "
+            f"{listing.stderr.strip()}"
+        )
+
+    container_ids = [ln.strip() for ln in listing.stdout.splitlines() if ln.strip()]
+    if not container_ids:
+        return
+
+    try:
+        result = subprocess.run(
+            [docker, "rm", "-f", *container_ids],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise RuntimeError(
+            f"Failed to purge Hermes Docker containers before task startup: {e}"
+        ) from e
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Failed to purge Hermes Docker containers before task startup: "
+            f"{result.stderr.strip()}"
+        )
+
+    logger.info(
+        "Purged %d Hermes Docker container(s) before task startup",
+        len(container_ids),
+    )
+
+
 def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
     """Run the docker orphan reaper once per process, if enabled.
 
@@ -1238,6 +1301,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         return _LocalEnvironment(cwd=cwd, timeout=timeout)
     
     elif env_type == "docker":
+        _purge_hermes_docker_containers()
         # One-shot orphan reaper: clean up labeled containers left behind by
         # prior Hermes processes that hit SIGKILL / OOM / a closed terminal
         # before the atexit cleanup hook could run.  Gated to once per
@@ -1245,6 +1309,13 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         # subagents, RL benchmarks) don't run the reaper N times.
         # Disable via ``terminal.docker_orphan_reaper: false`` (issue #20561).
         _maybe_reap_docker_orphans(cc)
+        # Force a fresh container per task. Label-only reuse can otherwise
+        # re-adopt a previously created bridged container whose network mode
+        # predates the create-time ``--network=none`` hardening.
+        if cc.get("docker_persist_across_processes", True):
+            logger.info(
+                "Forcing docker_persist_across_processes=false for Docker task startup"
+            )
         return _DockerEnvironment(
             image=image, cwd=cwd, timeout=timeout,
             cpu=cpu, memory=memory, disk=disk,
@@ -1256,7 +1327,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             env=docker_env,
             run_as_host_user=cc.get("docker_run_as_host_user", False),
             extra_args=docker_extra_args,
-            persist_across_processes=cc.get("docker_persist_across_processes", True),
+            persist_across_processes=False,
         )
     
     elif env_type == "singularity":

@@ -44,6 +44,7 @@ def _make_dummy_env(**kwargs):
         auto_mount_cwd=kwargs.get("auto_mount_cwd", False),
         env=kwargs.get("env"),
         run_as_host_user=kwargs.get("run_as_host_user", False),
+        extra_args=kwargs.get("extra_args"),
         persist_across_processes=kwargs.get("persist_across_processes", True),
     )
 
@@ -133,6 +134,53 @@ def test_auto_mount_host_cwd_adds_volume(monkeypatch, tmp_path):
     assert run_calls, "docker run should have been called"
     run_args_str = " ".join(run_calls[0][0])
     assert f"{project_dir}:/workspace" in run_args_str
+
+
+def test_docker_backend_forces_network_none(monkeypatch):
+    """Fresh Hermes Docker sandboxes must always be created on the ``none``
+    network, even if the caller left ``network=True`` / defaulted it."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(network=True)
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    assert "--network=none" in run_calls[0][0], (
+        f"docker run must force --network=none, got: {run_calls[0][0]}"
+    )
+
+
+def test_docker_backend_ignores_network_extra_args(monkeypatch):
+    """User-supplied docker_extra_args must not override the forced air-gap."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(extra_args=["--network=bridge", "--net", "host"])
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args = run_calls[0][0]
+    assert run_args.count("--network=none") == 1, f"expected a single forced none network, got {run_args}"
+    assert "--network=bridge" not in run_args, f"bridge override must be stripped, got {run_args}"
+    assert "--net" not in run_args, f"--net override must be stripped, got {run_args}"
+    assert "host" not in run_args, f"network override value must be stripped, got {run_args}"
+
+
+def test_docker_backend_allows_network_opt_out(monkeypatch):
+    """A local ``HERMES_ALLOW_NETWORK`` opt-out must stop forcing ``none`` and
+    preserve caller-supplied Docker network flags."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setenv("HERMES_ALLOW_NETWORK", "1")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(extra_args=["--network=host"])
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args = run_calls[0][0]
+    assert "--network=none" not in run_args, f"forced none must be disabled, got {run_args}"
+    assert "--network=host" in run_args, f"network override must be preserved, got {run_args}"
 
 
 def test_auto_mount_disabled_by_default(monkeypatch, tmp_path):
@@ -679,8 +727,12 @@ def test_labels_attribute_populated_after_init(monkeypatch):
 # ── Cross-process container reuse (issue #20561) ──────────────────
 
 
-def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
-                                     start_succeeds: bool = True):
+def _mock_subprocess_run_with_reuse(
+    monkeypatch,
+    ps_state: str | None,
+    start_succeeds: bool = True,
+    inspect_network_mode: str = "none",
+):
     """Reuse-aware subprocess.run mock.
 
     ``ps_state`` controls what ``docker ps -a --filter ...`` returns:
@@ -706,6 +758,10 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
                     return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
                 return subprocess.CompletedProcess(
                     cmd, 0, stdout=f"reused-cid\t{ps_state}\n", stderr="",
+                )
+            if sub == "inspect":
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{inspect_network_mode}\n", stderr="",
                 )
             if sub == "start":
                 if not start_succeeds:
@@ -786,6 +842,26 @@ def test_reuse_falls_back_to_fresh_run_when_start_fails(monkeypatch):
     )
     run_invocations = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
     assert run_invocations, "fallback to fresh docker run must happen on start failure"
+
+
+def test_reuse_rejects_network_mismatched_container(monkeypatch):
+    """A requested air-gapped container must not adopt a previously bridged
+    labeled container just because task/profile labels match."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    calls = _mock_subprocess_run_with_reuse(
+        monkeypatch,
+        ps_state="running",
+        inspect_network_mode="bridge",
+    )
+
+    env = _make_dummy_env(task_id="reuse-network-mismatch")
+
+    assert env._container_id == "fresh-cid", (
+        f"expected fresh container after network mismatch, got {env._container_id!r}"
+    )
+    run_invocations = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_invocations, "network-mismatched labeled container must not be reused"
 
 
 def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch):
@@ -908,6 +984,8 @@ def test_find_reusable_container_prefers_running_over_stopped(monkeypatch):
                     stdout="stopped-cid\texited\nrunning-cid\trunning\n",
                     stderr="",
                 )
+            if cmd[1] == "inspect":
+                return subprocess.CompletedProcess(cmd, 0, stdout="none\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
